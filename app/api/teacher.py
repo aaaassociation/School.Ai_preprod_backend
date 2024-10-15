@@ -2,50 +2,19 @@ from app import app, db
 from app.config import OPENAI_API_KEY, GOOEY_API_KEY
 from app.utils import send_request, send_request_with_rate_limit, send_generation_request, search_image, generate_voice
 from flask import request, jsonify, send_file
+from flask_socketio import SocketIO
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from io import BytesIO
 
+import os
 import json
 import time
 import base64
 import requests
 import openai
 
-@app.route('/save-course-data', methods=['POST'])
-def save_course_data():
-    data = request.json
-    id = data.get('id')
-    user_id = data.get("user_id")
-    course_outline = data.get("course_outline")
-    course_content = data.get("course_content")
-    input_data = data.get("input_data")
-    date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if id:
-        course_data = {
-            'id': id,
-            'user_id': user_id,
-            'course_outline': json.dumps(course_outline),
-            'course_content': json.dumps(course_content),
-            'input_data': input_data,
-            'date': date
-        }
-        db.collection('course_data').document(id).set(course_data, merge=True)
-        return jsonify({"message": "Course data updated successfully", "course_data": course_data}), 200
-    else:
-        doc_ref = db.collection('course_data').document()
-        doc_id = doc_ref.id
-        course_data = {
-            'id': doc_id,
-            'user_id': user_id,
-            'course_outline': json.dumps(course_outline),
-            'course_content': json.dumps(course_content),
-            'input_data': input_data,
-            'date': date
-        }
-        db.collection('course_data').add(course_data)
-        return jsonify({"message": "Course data saved successfully", "course_data": course_data}), 201
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 @app.route('/get-course-data/<user_id>', methods=['GET'])
 def get_course_data(user_id):
@@ -83,10 +52,8 @@ def generate_chapters():
     prompt = data['prompt']
     num_chapters = data.get('chapters', 6)
     num_subchapters = data.get('chapterDepth', 3)
-    # image = data.get('image')
-    # voice = data.get('voice')
-    # video = data.get('video')
-
+    voice = data.get('voice')
+    
     prompt_message = f"""
     Generate a comprehensive list of chapters and subchapters for a detailed course on {prompt}.
     The number of chapters is {num_chapters}, and each chapter has {num_subchapters} subchapters.
@@ -142,10 +109,10 @@ def generate_chapters():
 @app.route('/generate-content', methods=['POST'])
 def generate_content():
     data = request.json
-    chapter_name = data['chapter_name']
-    subchapter_name = data['subchapter_name']
+    chapters = data['chapters']
     prompt = data['prompt']
     voice_id = data['voice_id']
+    voice = data.get('voice')
 
     def fetch_content(chapter_name, subchapter_name):
         prompt_message = f"""
@@ -184,54 +151,59 @@ def generate_content():
                 print("Invalid response, retrying...")
                 time.sleep(2)
 
-    def generate_explanation(chapter_name: str, subchapter_name: str, prompt: str, voice_id: str):
-        prompt_message = f"Explain the course content for the chapter '{chapter_name}' and subchapter '{subchapter_name}'. The course is about {prompt}."
+    def notify_user(subchapter_content, chapter_name, subchapter_name):
+        content_parts = subchapter_content.split('[IMAGE:')
+        final_content = content_parts[0]
+        
+        for part in content_parts[1:]:
+            try:
+                image_prompt, rest_of_content = part.split(']', 1)
+                image_url = search_image(image_prompt.strip())
+                if image_url:
+                    final_content += f'<<Image:URL>> {image_url}\n' + rest_of_content
+                else:
+                    final_content += f'[IMAGE: {image_prompt.strip()}]' + rest_of_content
+            except ValueError:
+                final_content += f'[IMAGE: {part.strip()}]'
+          
+                
+        socketio.emit('subchapter_created', {
+            'chapter': chapter_name,
+            'subchapter': subchapter_name,
+            'content': final_content
+        })
+        print("SubChapter Created", chapter_name, subchapter_name)
 
-        request_payload = [
-            {"role": "system", "content": "You are an expert educator."},
-            {"role": "user", "content": prompt_message},
-        ]
-
-        payload = {
-            "model": "gpt-4",
-            "messages": request_payload,
-            "max_tokens": 4000
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
-
-        endpoint = "https://api.openai.com/v1/chat/completions"
-
-        response = send_request_with_rate_limit(endpoint, headers, payload)
-
-        explanation_text = response.get('choices', [{}])[0].get('message', {}).get('content', "No response generated.")
-
-        audio_content = generate_voice(chapter_name, subchapter_name, explanation_text, voice_id)
-
-    with ThreadPoolExecutor() as executor:
-        future_fetch = executor.submit(fetch_content, chapter_name, subchapter_name)
-        # future_explain = executor.submit(generate_explanation(chapter_name, subchapter_name, prompt, voice_id))
-
-        gpt_response = future_fetch.result()
-
-    content_parts = gpt_response.split('[IMAGE:')
-    final_content = content_parts[0]
-
-    for part in content_parts[1:]:
-        try:
-            image_prompt, rest_of_content = part.split(']', 1)
-            image_url = search_image(image_prompt.strip())
-            if image_url:
-                final_content += f'<<Image:URL>> {image_url}\n' + rest_of_content
-            else:
-                final_content += f'[IMAGE: {image_prompt.strip()}]' + rest_of_content
-        except ValueError:
-            final_content += f'[IMAGE: {part.strip()}]'
-
-    return jsonify(final_content)
+    def process_chapters():
+        with ThreadPoolExecutor() as executor:
+            first_subchapter_flag = False
+            
+            for chapter_name, subchapters in chapters.items():
+                for subchapter_index, subchapter_name in enumerate(subchapters):
+                    # Fetch content for the subchapter
+                    future_fetch = executor.submit(fetch_content, chapter_name, subchapter_name)                    
+                    subchapter_content = future_fetch.result()
+                    
+                    if subchapter_content:
+                        if not first_subchapter_flag and subchapter_index == 0:
+                            first_subchapter_flag = True
+                            socketio.emit('first_subchapter_created', {
+                                'chapter': chapter_name,
+                                'subchapter': subchapter_name,
+                                'content': subchapter_content
+                            })
+                            print("First SubChapter", chapter_name, subchapter_name)
+                        else:
+                            notify_user(subchapter_content, chapter_name, subchapter_name)
+                        
+                        if (voice):
+                            executor.submit(generate_voice, chapter_name, subchapter_name, subchapter_content, prompt, voice_id)
+                            
+            socketio.emit('content_generation_complete', {'message': 'All content has been generated.'})
+            print("Finished")
+            
+    socketio.start_background_task(process_chapters)
+    return jsonify({"message": "Content generation started."})
 
 @app.route('/dig-deeper', methods=['POST'])
 def dig_deeper():
@@ -284,6 +256,36 @@ def fetch_explanation():
     chapter_name = data['chapter_name']
     subchapter_name = data['subchapter_name']
     prompt = data['prompt']
+
+    max_wait_time = 60
+    poll_interval = 10
+    elapsed_time = 0
+
+    while elapsed_time < max_wait_time:
+        audio_record = db.collection('audio')\
+            .where('chapter_name', '==', chapter_name)\
+            .where('subchapter_name', '==', subchapter_name)\
+            .where('prompt', '==', prompt)\
+            .stream()
+
+        audio_record_list = [doc.to_dict() for doc in audio_record]
+
+        if audio_record_list:
+            name = audio_record_list[0]['name']
+            file_path = os.path.join('static', 'audio', f"{name}.mp3")
+            file_path = os.path.abspath(file_path)
+
+            if os.path.exists(file_path):
+                return send_file(file_path, mimetype='audio/mpeg')
+            else:
+                print(f"File {file_path} not found, waiting...")
+        else:
+            print("Audio info not found in Firebase, waiting...")
+
+        time.sleep(poll_interval)
+        elapsed_time += poll_interval
+
+    return jsonify({"error": "Audio file is not yet available after waiting."}), 408
 
 @app.route('/ask-question', methods=['POST'])
 def ask_question():

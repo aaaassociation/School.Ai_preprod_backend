@@ -95,26 +95,35 @@ def search_image(query):
     
     return None
 
-def generate_voice(chapter_name: str, subchapter_name: str, text: str, voice_id: str) -> str:
+def generate_voice(chapter_name: str, subchapter_name: str, content: str, prompt: str, voice_id: str) -> str:
     unique_id = uuid.uuid4()
-    output_file_path = os.path.join('static', 'audio', f"{unique_id}.mp3")
-    output_format="mp3_22050_32"
+    output_file_name = f"{unique_id}.mp3"
+    output_file_path = os.path.join('static', 'audio', output_file_name)
     output_file_path = os.path.abspath(output_file_path)
-
+    
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
-
-    db.collection('audio').add({
-        'chapter_name': chapter_name,
-        'subchapter_name': subchapter_name,
-        'prompt': text,
-        'uuid': str(unique_id)
-    })
-
-    return text_to_speech_file(text, voice_id, output_file_path)
+    
+    audio_file_path = text_to_speech_file(content, voice_id, output_file_path)
+    
+    if os.path.exists(audio_file_path):
+        try:
+            db.collection('audio').add({
+                'chapter_name': chapter_name,
+                'subchapter_name': subchapter_name,
+                'prompt': prompt,
+                'name': str(unique_id)
+            })
+            print(f"Voice generated and saved to Firebase for {chapter_name} - {subchapter_name}")
+        except Exception as e:
+            print(f"Failed to save audio info to Firebase: {e}")
+    else:
+        print("Audio generation failed")
+        print(f"Failed to generate voice for {chapter_name} - {subchapter_name}")
 
 def text_to_speech_file(text: str, voice_id: str, file_path: str) -> str:
     max_chars = 2500
     chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+    
     with open(file_path, "wb") as f:
         for chunk in chunks:
             retry_attempts = 3
